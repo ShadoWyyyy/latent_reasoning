@@ -24,7 +24,7 @@ class GPT2LatentReasoningStudent(nn.Module):
         self,
         model_name: str = "gpt2",
         teacher_hidden_size: Optional[int] = 768,   # 教师 hidden 维度；None=与 student 相同
-        alpha_consistency: float = 0.001,             # 答案段一致性损失系数
+        alpha_consistency: float = 1,             # 答案段一致性损失系数
     ):
         super().__init__()
         # self.gpt2_lm: GPT2LMHeadModel = GPT2LMHeadModel.from_pretrained(model_name)
@@ -70,7 +70,7 @@ class GPT2LatentReasoningStudent(nn.Module):
         self.beta_nll = 1
 
         self.terminator_id = None
-        self.exit_threshold = 1
+        self.exit_threshold = 1e3
 
     # ------------------------------------------------------------
     # 基础积木
@@ -158,87 +158,77 @@ class GPT2LatentReasoningStudent(nn.Module):
         Returns:
             scalar loss (mean over selected tokens)
         """
-        B, L, V = logits.size()
-        device = logits.device
+        nll_sum = logits.new_zeros(()); tok_cnt = 0 
+        B = input_ids.size(0)
+        a_start = [(int(q_len[i].item()) + int(r_len[i].item()) - 1) for i in range(B)] 
+        for i in range(B): 
+            al = int(a_len[i].item()); rl = int(r_len[i].item()); ql = int(q_len[i].item())
+            logit_slice = logits[i, a_start[i]: a_start[i] + al, :] 
+            # tmp_ids = torch.argmax(F.softmax(logit_slice, dim=-1), dim=-1) 
+            label_slice = input_ids[i, ql + rl: ql + rl + al] 
+            nll_sum = nll_sum + F.cross_entropy(logit_slice, label_slice, reduction="sum") 
+            tok_cnt += al 
+        
+        loss_nll = nll_sum / max(1, tok_cnt)
 
-        if L < 2:
-            return logits.new_zeros(())
-
-        logits_shift = logits[:, :-1, :].contiguous()    # [B, L-1, V]
-        labels_shift = input_ids[:, 1:].contiguous()     # [B, L-1]
-
-        # positions for labels in original indexing: [1, 2, ..., L-1]
-        pos_labels = torch.arange(1, L, device=device).unsqueeze(0).expand(B, L-1)  # [B, L-1]
-
-        # answer tokens in original indexing start at a_start = q_len + r_len
-        a_start = (q_len + r_len - 1).unsqueeze(1)   # [B, 1]
-        a_end = (q_len + r_len + a_len - 1).unsqueeze(1)  # exclusive end [B,1]
-
-        # mask where labels correspond to answer tokens
-        answer_mask = (pos_labels >= a_start) & (pos_labels < a_end)  # [B, L-1], boolean
-
-        # Build masked labels: non-answer positions -> ignore_index (-100)
-        labels_masked = labels_shift.clone()
-        labels_masked[~answer_mask] = -100
-
-        # Flatten and compute cross_entropy with ignore_index
-        loss_nll = F.cross_entropy(
-            logits_shift.view(-1, V),
-            labels_masked.view(-1),
-            ignore_index=-100,
-            reduction="mean",
-        )
         return loss_nll
 
     # ------------------------------------------------------------
     # 一致性损失
     # ------------------------------------------------------------
-    def _compute_consistency(
-        self,
-        hs: torch.Tensor,                     # [B, L, D] 学生 hidden
-        start: torch.Tensor,                  # [B] 每个样本的起始位置
-        length: torch.Tensor,                 # [B] 每个样本的有效长度
-        teacher_hiddens: torch.Tensor         # [B, Tmax, Tdim]
-    ) -> tuple[torch.Tensor, int]:
-        """
-        通用一致性计算 (answer/reasoning 都能用)
+    def _compute_answer_consistency( 
+        self, hs: torch.Tensor, # [B, L, D]（拼接后的 block 输出） 
+        a_start: int, # A 段在 H_in 中的起始位置 = max_q + R_t 
+        a_len: torch.Tensor, # [B] 
+        teacher_answer_hiddens: Optional[torch.Tensor] # [B, Amax, Tdim] 
+    ) -> torch.Tensor: 
+        
+        if teacher_answer_hiddens is None: 
+            return hs.new_zeros(()) 
+        
+        tea_a = self.teacher_to_student(teacher_answer_hiddens).detach() # [B,Amax,D] 
+        B = hs.size(0) 
+        cons_sum = hs.new_zeros(()) 
+        cons_cnt = 0
 
-        返回:
-            cons_sum: torch.Tensor 标量, 总 loss
-            cons_cnt: int 有效 token 数
-        """
-        if teacher_hiddens is None:
-            return hs.new_zeros(()), 0
+        for i in range(B): 
+            al = int(a_len[i].item()) 
+            if al <= 0: continue 
+            stu_a = hs[i, a_start[i]: a_start[i] + al, :] # [al, D] 
+            tea_i = tea_a[i, : al, :] # [al, D] 
+            cons_sum = cons_sum + F.mse_loss(stu_a, tea_i, reduction="sum") 
+            cons_cnt += al 
 
-        B, L, D = hs.size()
-        Tmax = teacher_hiddens.size(1)
+        if cons_cnt == 0: 
+            return hs.new_zeros(()) 
+        
+        return cons_sum, cons_cnt 
+        
+    def _compute_reasoning_consistency( 
+        self, hs: torch.Tensor, # [B, L, D]（拼接后的 block 输出） 
+        r_start: int, 
+        r_len: torch.Tensor, # [B] 
+        teacher_reasoning_hiddens: Optional[torch.Tensor] # [B, Amax, Tdim] 
+    ) -> torch.Tensor: 
+        if teacher_reasoning_hiddens is None: 
+            return hs.new_zeros(()) 
+        
+        tea_r = self.teacher_to_student(teacher_reasoning_hiddens).detach() 
+        B = hs.size(0) 
+        cons_sum = hs.new_zeros(()) 
+        cons_cnt = 0 
+        for i in range(B): 
+            rl = int(r_len[i]) 
+            if rl <= 0: 
+                continue 
+            stu_r = hs[i, r_start[i]: r_start[i] + rl, :] # [rl, D] 
+            tea_i = tea_r[i, :rl, :] # [rl, D] 
+            cons_sum = cons_sum + F.mse_loss(stu_r, tea_i, reduction="sum") 
+            cons_cnt += rl
 
-        # 投影到 student hidden space
-        tea_h = self.teacher_to_student(teacher_hiddens).detach()  # [B, Tmax, D]
-
-        # 找到 batch 内最大长度
-        max_len = int(length.max().item())
-        if max_len == 0:
-            return hs.new_zeros(()), 0
-
-        # === 批量收集 student hidden ===
-        stu_h = torch.zeros(B, max_len, D, device=hs.device)
-        for i in range(B):
-            li = int(length[i].item())
-            if li > 0:
-                stu_h[i, :li] = hs[i, start[i]: start[i] + li]
-
-        # teacher 对齐
-        tea_h = tea_h[:, :max_len, :]
-
-        # 有效 mask
-        mask_pad = torch.arange(max_len, device=hs.device).unsqueeze(0) < length.unsqueeze(1)  # [B, max_len]
-
-        # === 计算 MSE（只取有效 token） ===
-        mse = nn.MSELoss(reduction="sum")
-        cons_sum = mse(stu_h[mask_pad], tea_h[mask_pad])   # [N, D] 对齐比较
-        cons_cnt = mask_pad.sum().item()                   # 有效 token 数
-
+        if cons_cnt == 0: 
+            return hs.new_zeros(()) 
+        
         return cons_sum, cons_cnt
 
     # ------------------------------------------------------------
@@ -269,15 +259,12 @@ class GPT2LatentReasoningStudent(nn.Module):
         loss_nll = self._compute_nll_loss(logits, input_ids, q_len, r_len, a_len)
 
         # 4) 一致性
-        # B = batch size
-        a_start = q_len + r_len - 1   # [B]
-        r_start = q_len - 1           # [B]
-
-        # 一致性损失
-        loss_cons_a, count_cons_a = self._compute_consistency(hs, a_start, a_len, teacher_answer_hiddens)
-        loss_cons_r, count_cons_r = self._compute_consistency(hs, r_start, r_len, teacher_reasoning_hiddens)
-
-        # 总一致性损失
+        B = input_ids.size(0) 
+        a_start = [(int(q_len[i].item()) + int(r_len[i].item()) - 1) for i in range(B)] 
+        r_start = [(int(q_len[i].item()) - 1) for i in range(B)] 
+         
+        loss_cons_a, count_cons_a = self._compute_answer_consistency(hs, a_start, a_len, teacher_answer_hiddens) 
+        loss_cons_r, count_cons_r = self._compute_reasoning_consistency(hs, r_start, r_len, teacher_reasoning_hiddens) 
         loss_cons = (loss_cons_a + loss_cons_r) / (count_cons_a + count_cons_r)
 
         # 5) 总 loss
